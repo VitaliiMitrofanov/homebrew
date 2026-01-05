@@ -32,19 +32,17 @@ class PDFProcessingService
 
     function parseMoney(string $value): int|false
     {
-        // Убираем пробелы и знак, оставляем только цифры и запятую/точку
         $clean = trim($value);
-
-        // Регулярка: необязательный знак, цифры с пробелами, запятая/точка и 2 цифры
-        if (preg_match('/^[+\-]?\s*\d{1,3}(\s?\d{3})*[.,]\d{2}\s*₽?$/u', $clean) !== 1) {
-            return false;
-        }
-        $clean = str_replace([' ', '₽'], '', $clean);
-        $clean = ltrim($clean, '+-');
         $clean = str_replace(',', '.', $clean);
-        $amount = (float) $clean;
-
-        return (int) round($amount);
+        $pos = strpos($clean, '.');  // позиция первой точки
+        if ($pos === false) {
+            return false;
+        } else {
+            $clean = substr($clean, 0, $pos);
+        }
+        $clean = preg_replace('/\D+/', '', $clean);
+        // запоминаем, был ли минус
+        return (int) $clean;
     }
 
     function hasOnlyOneString(array $arr): bool
@@ -60,6 +58,27 @@ class PDFProcessingService
             count($nonEmptyStrings) + count(
                 array_filter($arr, fn($v) => $v === '')
             ) === count($arr);
+    }
+
+    private function detectCategory(array $operation): string
+    {
+        $rules = config('operation_categories');
+        $description = mb_strtoupper($operation['description'] ?? '');
+        $action = $operation['action'] ?? null;  // income/expense
+
+        if (empty($description) || !isset($rules[$action])) {
+            return 'noCat';
+        }
+
+        foreach ($rules[$action] as $categoryName => $rule) {
+            foreach ($rule['contains'] as $needle) {
+                if (mb_stripos($description, mb_strtoupper($needle)) !== false) {
+                    return $categoryName;
+                }
+            }
+        }
+
+        return 'noCat';
     }
 
     public function parseSberbankPDF($filePath)
@@ -151,19 +170,22 @@ class PDFProcessingService
             }
             $sum = array_merge($sum, $results);
         }
-        $rowIndex = 0;
+        LOG::info('Summarized YaPPDF data: ' . print_r($sum, true));
         $currentOperation = NULL;
         foreach ($sum as $row) {
             $money = $this->parseMoney($row[5]);
             if ($this->isDate($row[2]) && is_integer($money)) {
                 // Это новая строка. Сохраняем накопленные данные и создаем новый массив
-                if ($currentOperation !== NULL) $this->parsedData[] = $currentOperation;
+                if ($currentOperation !== NULL) {
+                    $currentOperation['category'] = $this->detectCategory($currentOperation);
+                    $this->parsedData[] = $currentOperation;
+                }
                 $currentOperation = [
                     'date' => $row[2],
                     'time' => '',
                     'aCode' => 'yap',
                     'category' => '',
-                    'description' => $row[1],
+                    'description' => '',
                     'action' => str_contains($row[5], '+') ? 'income' : 'expense',
                     'amount' => $money
                 ];
@@ -171,7 +193,7 @@ class PDFProcessingService
             if ($currentOperation !== NULL && $this->isTime($row[2])) {
                 $currentOperation['time'] = trim($row[2], 'в ');
             }
-            if ($currentOperation !== NULL && $this->hasOnlyOneString($row)) {
+            if ($currentOperation !== NULL && $row[1] != 'Описание операции') {
                 $currentOperation['description'] .= ' ' . $row[1];
             }
         }
@@ -225,13 +247,18 @@ class PDFProcessingService
             $sum = array_merge($sum, $results);
         }
 
-        $rowIndex = 0;
+        $currentOperation = NULL;
+
         foreach ($sum as $row) {
             // Ищем новую запись. Если у строки есть дата и денежная сумма, то это оно
             // В четвертом столбце будет категория, а в пятом сумма
             $money = $this->parseMoney($row[2]);
             if ($this->isDate($row[0]) && is_integer($money)) {
-                $this->parsedData[$rowIndex] = [
+                if ($currentOperation !== NULL) {
+                    $currentOperation['category'] = $this->detectCategory($currentOperation);
+                    $this->parsedData[] = $currentOperation;
+                }
+                $currentOperation = [
                     'date' => $row[0],
                     'time' => '',
                     'aCode' => 'tbank',
@@ -240,12 +267,12 @@ class PDFProcessingService
                     'action' => str_contains($row[2], '+') ? 'income' : 'expense',
                     'amount' => $money
                 ];
-                $rowIndex++;
-            } elseif ($this->isTime($row[0])) {
-                $this->parsedData[$rowIndex - 1]['time'] .= ' ' . $row[0];
-                $this->parsedData[$rowIndex - 1]['description'] .= ' ' . $row[4];
-            } elseif ($rowIndex > 0) {
-                $this->parsedData[$rowIndex - 1]['description'] .= ' ' . $row[4];
+            }
+            if ($currentOperation !== NULL && $this->isTime($row[0])) {
+                $currentOperation['time'] = $row[2];
+            }
+            if ($currentOperation !== NULL && $this->hasOnlyOneString($row)) {
+                $currentOperation['description'] .= ' ' . $row[4];
             }
         }
 
