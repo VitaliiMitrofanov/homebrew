@@ -17,3 +17,7 @@ yarn-error.log
 /.fleet
 /.idea
 /.vscode
+
+
+!vendor/initred/laravel-tabula/lib/tabula-1.0.5-jar-with-dependencies.jar
+!vendor/initred/laravel-tabula/src/InitRed/Tabula/Tabula.php

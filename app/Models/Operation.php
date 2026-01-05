@@ -20,6 +20,7 @@ class Operation extends Model
         'action',
         'ammount',
         'aCode',
+        'username',
     ];
 
 }
