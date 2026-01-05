@@ -2,137 +2,231 @@
 
 namespace App\Handlers;
 
-use Illuminate\Support\Stringable;
 use DefStudio\Telegraph\Handlers\WebhookHandler;
 
-use DefStudio\Telegraph\DTO\Document;
-use DefStudio\Telegraph\DTO\Attachment;
-use DefStudio\Telegraph\DTO\Photo;
+use DefStudio\Telegraph\Keyboard\Button;
+use DefStudio\Telegraph\Keyboard\Keyboard;
 
+use DefStudio\Telegraph\DTO\Document;
+
+use App\Models\Operation;
+use App\Services\PDFProcessingService;
+
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Illuminate\Support\Stringable;
+use InitRed\Tabula\Tabula;
 
 use Illuminate\Support\Facades\Log;
 
-use Spatie\PdfToText\Pdf;
-use Illuminate\Support\Facades\File;
-use Illuminate\Support\Str;
-use Illuminate\Support\Facades\Http;
-use InitRed\Tabula\Tabula;
-use App\Models\Operation;
 
-class CustomWebhookHandler extends WebhookHandler {
-    protected function handleChatMessage(Stringable $text): void {
+class CustomWebhookHandler extends WebhookHandler
+{
+    private $actionList = [
+        'statement' => 'statement',
+        'sberbank' => ["Please upload your Sberbank statement (PDF file). I'm waiting..."],
+        'yap' => ["Please upload your YaP statement (PDF file). I'm waiting..."],
+        'tbank' => ["Please upload your TBank statement (PDF file). I'm waiting..."],
+    ];
 
+    public function statement(): void
+    {
+        $this
+            ->chat
+            ->markdown('Welcome! Choose an action:')
+            ->keyboard(Keyboard::make()->buttons([
+                Button::make('Upload Sberbank statement')->action('uploadStatement')->param('statement', 'sberbank'),
+                Button::make('Upload YaP statement')->action('uploadStatement')->param('statement', 'yap'),
+                Button::make('Upload TBank statement')->action('uploadStatement')->param('statement', 'tbank'),
+            ]))
+            ->send();
+    }
+
+    public function uploadStatement(): void
+    {
+        $statement = $this->data->get('statement');
+        $this->chat->markdown($this->actionList[$statement][0])->send();
+
+        $cacheKey = 'tg:callback:statement:' . $this->chat->id;
+        Cache::put($cacheKey, $statement, now()->addMinutes(10));
+
+        LOG::info('Step 1 - prompt sent');
+    }
+
+    protected function handleChatMessage(Stringable $text): void
+    {
+        LOG::info('Step 2 - message received');
+        $cacheKey = 'tg:callback:statement:' . $this->chat->id;
+        $statement = Cache::get($cacheKey);
+        LOG::info('Selected statement: ' . $statement);
         $document = $this->message->document();
-        
+        $userName = $this->message->from()->username();
+
         if ($document instanceof Document) {
             $fileId = $document->id();
             $fileName = $document->filename();
             $fileMime = $document->mimeType();
 
-            $response = $this->bot->getFileInfo($fileId)->send();
-            $this->chat->html("Received document: ID=" . $fileId . ", Name=" . $fileName . ", MimeType=" . $fileMime)->send();
+            $this->chat->html("Received document from " . $userName . ":\nMimeType=" . $fileMime)->send();
 
-            if($fileMime != "application/pdf") {
-                $this->chat->html("This is a " . $fileMime . ". Please send a PDF document.")->send();
+            if ($fileMime != 'application/pdf' && !$statement) {
+                $this->chat->html('This is a ' . $fileMime . '. Please send a PDF document. Or i forget what ive asked for.')->send();
                 return;
             }
-            $this->chat->html("Processing PDF document...")->send();
+            $path = $this->bot->store($fileId, Storage::path('telegraph'));
 
-            $path = $this->bot->store($fileId, Storage::path("telegraph"));
-            $content = Pdf::getText($path);
-            $tabula = new Tabula('/usr/bin/');
+            $processingService = new PDFProcessingService();
+            switch ($statement) {
+                case 'sberbank':
+                    $this->chat->html('Processing Sberbank statement PDF...')->send();
 
-            $tabula->setPdf($path)
-                ->setOptions([
-                    'format' => 'JSON',
-                    'pages' => 'all',
-                    'lattice' => false,
-                    'stream' => true,
-                    'outfile' => storage_path("app/public/test.JSON"),
-                ])
-                ->convert();
+                    $processedData = $processingService->parseSberbankPDF($path);
+                    $insertedRowsCount = 0;
 
-            $content = File::get(storage_path('app/public/test.JSON'));
-            $json = json_decode($content, true);
-            $collection = collect($json);
-            $data = $collection->select('data')->all();
-            
-            $sum = [];
-            $rowIndex = 0;
-            foreach($data as $sheet) {
-                $results = [];
-                foreach ($sheet['data'] as $rotindex => $row) {
-
-                    foreach ($row as $celindex => $cell) {
-                        $results[$rowIndex][$celindex] = $cell['text'];
-                    
+                    foreach ($processedData as $result) {
+                        $operation = Operation::firstOrcreate(
+                            [
+                                'datatime' => date('Y-m-d H:i:s', strtotime($result['date'] . ' ' . $result['time'])),
+                                'aCode' => $result['aCode'],
+                                'category' => $result['category'],
+                                'action' => $result['action'],
+                                'ammount' => $result['amount'],
+                                'description' => trim($result['description']),
+                                'username' => $userName,
+                            ]
+                        );
+                        if (!$operation->wasRecentlyCreated) {
+                            continue;  // Запись уже существует, пропускаем создание
+                        }
+                        if ($operation->wasRecentlyCreated) {
+                            $insertedRowsCount++;
+                        }
                     }
-                    $rowIndex++;
-                }
-                $sum = array_merge($sum, $results);
-            }
-            
-            $results = [];
-            $rowIndex = 0;
-            foreach ($sum as $row) {
-                //Ищем новую запись. Если у строки есть дата и время, то это оно
-                //В четвертом столбце будет категория, а в пятом сумма
-                if($row[0] != "" AND $row[1] != "") {
-                    
-                    $results[$rowIndex] = [
-                        'date' => $row[0],
-                        'time' => $row[1],
-                        'aCode' => $row[2],
-                        'category' => $row[3],
-                        'description' => '',
-                        'action' => str_contains($row[4], '+') ? 'income' : 'expense',
-                        'amount' => floatval(str_replace(' ', '', $row[4]))
-                    ];
-                    $rowIndex++;
-                }
-                // Если не указано время во втором столбце, то это продолжение записи
-                if($row[1] == "" ) {
-                    $results[$rowIndex-1]['description'] .= ' ' . $row[3];
-                }
+                    $this->chat->html("Parsed " . count($processedData) . " rows. Inserted " . $insertedRowsCount . " new operations.")->send();
+                    break;
+                case 'yap':
+                    $this->chat->html('Processing YaP statement PDF...')->send();
 
-            
-            }
-            $insertedRowsCount = 0;
-            foreach ($results as $result) {
-                $operation = Operation::firstOrcreate(
-                     [
-                        'datatime' => date('Y-m-d H:i:s', strtotime($result['date'] . ' ' . $result['time'])),
-                        'aCode' => $result['aCode'],
-                        'category' => $result['category'],
-                        'action' => $result['action'],
-                        'ammount' => $result['amount'],
-                        'description' => trim($result['description']),
-                     ]
-                );
-                if(!$operation->wasRecentlyCreated) {
-                    LOG::info('Operation already exists: Было' . json_encode($operation) . ' Стало ' . json_encode($result));
-                    continue; // Запись уже существует, пропускаем создание
-                }
-                if ($operation->wasRecentlyCreated) {
-                    $insertedRowsCount++;
-                }
-            
-            }
-            $this->chat->html("Parsed " . count($results) . " rows. Inserted " . $insertedRowsCount . " new operations.")->send();
+                    $processedData = $processingService->parseYaPPDF($path);
+                    break;
+                case 'tbank':
+                    $this->chat->html('Processing TBank statement PDF...')->send(); 
 
+                    $processedData = $processingService->parseTBankPDF($path);
+                    break;
+                default:
+                    $this->chat->html('Unknown statement type.')->send();
+                    return;
+            }
 
+            /*
+             * $fileId = $document->id();
+             * $fileName = $document->filename();
+             * $fileMime = $document->mimeType();
+             *
+             * $response = $this->bot->getFileInfo($fileId)->send();
+             * $this->chat->html("Received document: ID=" . $fileId . ", Name=" . $fileName . ", MimeType=" . $fileMime)->send();
+             *
+             * if($fileMime != "application/pdf") {
+             *     $this->chat->html("This is a " . $fileMime . ". Please send a PDF document.")->send();
+             *     return;
+             * }
+             * $this->chat->html("Processing PDF document...")->send();
+             *
+             * $path = $this->bot->store($fileId, Storage::path("telegraph"));
+             * $tabula = new Tabula('/usr/bin/');
+             *
+             * $tabula->setPdf($path)
+             *     ->setOptions([
+             *         'format' => 'JSON',
+             *         'pages' => 'all',
+             *         'lattice' => false,
+             *         'stream' => true,
+             *         'outfile' => storage_path("app/public/test.JSON"),
+             *     ])
+             *     ->convert();
+             *
+             * $content = File::get(storage_path('app/public/test.JSON'));
+             * $json = json_decode($content, true);
+             * $collection = collect($json);
+             * $data = $collection->select('data')->all();
+             *
+             * $sum = [];
+             * $rowIndex = 0;
+             * foreach($data as $sheet) {
+             *     $results = [];
+             *     foreach ($sheet['data'] as $rotindex => $row) {
+             *
+             *         foreach ($row as $celindex => $cell) {
+             *             $results[$rowIndex][$celindex] = $cell['text'];
+             *
+             *         }
+             *         $rowIndex++;
+             *     }
+             *     $sum = array_merge($sum, $results);
+             * }
+             *
+             * $results = [];
+             * $rowIndex = 0;
+             * foreach ($sum as $row) {
+             *     //Ищем новую запись. Если у строки есть дата и время, то это оно
+             *     //В четвертом столбце будет категория, а в пятом сумма
+             *     if($row[0] != "" AND $row[1] != "") {
+             *
+             *         $results[$rowIndex] = [
+             *             'date' => $row[0],
+             *             'time' => $row[1],
+             *             'aCode' => $row[2],
+             *             'category' => $row[3],
+             *             'description' => '',
+             *             'action' => str_contains($row[4], '+') ? 'income' : 'expense',
+             *             'amount' => floatval(str_replace(' ', '', $row[4]))
+             *         ];
+             *         $rowIndex++;
+             *     }
+             *     // Если не указано время во втором столбце, то это продолжение записи
+             *     if($row[1] == "" ) {
+             *         $results[$rowIndex-1]['description'] .= ' ' . $row[3];
+             *     }
+             *
+             *
+             * }
+             * $insertedRowsCount = 0;
+             * foreach ($results as $result) {
+             *     $operation = Operation::firstOrcreate(
+             *          [
+             *             'datatime' => date('Y-m-d H:i:s', strtotime($result['date'] . ' ' . $result['time'])),
+             *             'aCode' => $result['aCode'],
+             *             'category' => $result['category'],
+             *             'action' => $result['action'],
+             *             'ammount' => $result['amount'],
+             *             'description' => trim($result['description']),
+             *          ]
+             *     );
+             *     if(!$operation->wasRecentlyCreated) {
+             *         //LOG::info('Operation already exists: Было' . json_encode($operation) . ' Стало ' . json_encode($result));
+             *         continue; // Запись уже существует, пропускаем создание
+             *     }
+             *     if ($operation->wasRecentlyCreated) {
+             *         $insertedRowsCount++;
+             *     }
+             *
+             * }
+             * $this->chat->html("Parsed " . count($results) . " rows. Inserted " . $insertedRowsCount . " new operations.")->send();
+             */
+            Cache::forget($cacheKey);
+            STORAGE::delete($path);
+            $this->chat->html('PDF processing completed.')->send();
             return;
         }
 
-        $photo = $this->message->photos()->first();
-        if ($photo instanceof Photo) {
-            $this->chat->html("Вы отправили фото с id: " . $photo->id())->send();
-            return;
-        }
         // полученное сообщение отправляется обратно в чат
         $this->chat->html("Вы написали: $text")->send();
     }
+
     public function hi(string $userName)
     {
         $this->chat->markdown("*Hi* $userName, happy to be here!")->send();
