@@ -21,6 +21,7 @@ class Operation extends Model
         'ammount',
         'aCode',
         'username',
+        'data_source',
     ];
 
 }

@@ -78,44 +78,25 @@ class CustomWebhookHandler extends WebhookHandler
             }
             $path = $this->bot->store($fileId, Storage::path('telegraph'));
 
-            $processingService = new PDFProcessingService();
+            $processingService = new PDFProcessingService($userName, $statement);
             switch ($statement) {
                 case 'sberbank':
                     $this->chat->html('Processing Sberbank statement PDF...')->send();
 
                     $processedData = $processingService->parseSberbankPDF($path);
-                    $insertedRowsCount = 0;
-
-                    foreach ($processedData as $result) {
-                        $operation = Operation::firstOrcreate(
-                            [
-                                'datatime' => date('Y-m-d H:i:s', strtotime($result['date'] . ' ' . $result['time'])),
-                                'aCode' => $result['aCode'],
-                                'category' => $result['category'],
-                                'action' => $result['action'],
-                                'ammount' => $result['amount'],
-                                'description' => trim($result['description']),
-                                'username' => $userName,
-                            ]
-                        );
-                        if (!$operation->wasRecentlyCreated) {
-                            continue;  // Запись уже существует, пропускаем создание
-                        }
-                        if ($operation->wasRecentlyCreated) {
-                            $insertedRowsCount++;
-                        }
-                    }
-                    $this->chat->html("Parsed " . count($processedData) . " rows. Inserted " . $insertedRowsCount . " new operations.")->send();
+                    
                     break;
                 case 'yap':
                     $this->chat->html('Processing YaP statement PDF...')->send();
 
                     $processedData = $processingService->parseYaPPDF($path);
+                    
                     break;
                 case 'tbank':
                     $this->chat->html('Processing TBank statement PDF...')->send(); 
 
                     $processedData = $processingService->parseTBankPDF($path);
+
                     break;
                 default:
                     $this->chat->html('Unknown statement type.')->send();
@@ -124,6 +105,7 @@ class CustomWebhookHandler extends WebhookHandler
 
             Cache::forget($cacheKey);
             $this->chat->html('PDF processing completed.')->send();
+            $this->chat->html("Parsed " . $processedData['parsed'] . " rows. Inserted " . $processedData['loaded'] . " new operations.")->send();
             return;
         }
 

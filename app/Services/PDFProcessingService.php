@@ -11,9 +11,13 @@ class PDFProcessingService
 {
     private Tabula $tabula;
     private array $parcedData;
+    private string $userName;
+    private string $statement;
 
-    public function __construct()
+    public function __construct($userName, $statement)
     {
+        $this->userName = $userName;
+        $this->statement = $statement;
         $this->tabula = new Tabula('/usr/bin/');
     }
 
@@ -81,6 +85,33 @@ class PDFProcessingService
         return 'noCat';
     }
 
+    public function loadDataInDatabase()
+    {
+        $insertedRowsCount = 0;
+
+        foreach ($this->parsedData as $result) {
+            $operation = Operation::firstOrcreate(
+                [
+                    'datatime' => date('Y-m-d H:i:s', strtotime($result['date'] . ' ' . $result['time'])),
+                    'aCode' => $result['aCode'],
+                    'category' => $result['category'],
+                    'action' => $result['action'],
+                    'ammount' => $result['amount'],
+                    'description' => trim($result['description']),
+                    'username' => $this->userName,
+                    'data_source' => $this->statement,
+                ]
+            );
+            if (!$operation->wasRecentlyCreated) {
+                continue;  // Запись уже существует, пропускаем создание
+            }
+            if ($operation->wasRecentlyCreated) {
+                $insertedRowsCount++;
+            }
+        }
+        return $insertedRowsCount;
+    }
+
     public function parseSberbankPDF($filePath)
     {
         $this
@@ -135,7 +166,11 @@ class PDFProcessingService
         }
 
         File::delete(storage_path('app/public/parsed_data_sber.JSON'));
-        return array_values($this->parsedData);  // Возвращаем разобранные данные
+
+        $parsed = count($this->parsedData);
+        $loadData = $this->loadDataInDatabase();
+
+        return ['parsed' => $parsed, 'loaded' => $loadData];  // Возвращаем разобранные данные
     }
 
     public function parseYaPPDF($filePath)
@@ -170,7 +205,6 @@ class PDFProcessingService
             }
             $sum = array_merge($sum, $results);
         }
-        LOG::info('Summarized YaPPDF data: ' . print_r($sum, true));
         $currentOperation = NULL;
         foreach ($sum as $row) {
             $money = $this->parseMoney($row[5]);
@@ -199,9 +233,11 @@ class PDFProcessingService
         }
 
         File::delete(storage_path('app/public/parsed_data_yap.JSON'));
-        LOG::info('Parsed YaPPDF data: ' . print_r($this->parsedData, true));
 
-        return $this->parsedData;  // Возвращаем разобранные данные
+        $parsed = count($this->parsedData);
+        $loadData = $this->loadDataInDatabase();
+
+        return ['parsed' => $parsed, 'loaded' => $loadData];  // Возвращаем разобранные данные
     }
 
     public function parseTBankPDF($filePath)
@@ -246,7 +282,6 @@ class PDFProcessingService
             }
             $sum = array_merge($sum, $results);
         }
-
         $currentOperation = NULL;
 
         foreach ($sum as $row) {
@@ -269,9 +304,9 @@ class PDFProcessingService
                 ];
             }
             if ($currentOperation !== NULL && $this->isTime($row[0])) {
-                $currentOperation['time'] = $row[2];
+                $currentOperation['time'] = $row[0];
             }
-            if ($currentOperation !== NULL && $this->hasOnlyOneString($row)) {
+            if ($currentOperation !== NULL && $row[4] != '') {
                 $currentOperation['description'] .= ' ' . $row[4];
             }
         }
@@ -279,8 +314,9 @@ class PDFProcessingService
         File::delete(storage_path('app/public/parsed_data_tbank_page1_area.JSON'));
         File::delete(storage_path('app/public/parsed_data_tbank_all_sheets.JSON'));
 
-        LOG::info('TBank parsed data: ' . print_r($this->parsedData, true));
+        $parsed = count($this->parsedData);
+        $loadData = $this->loadDataInDatabase();
 
-        return array_values($this->parsedData);  // Возвращаем разобранные данные
+        return ['parsed' => $parsed, 'loaded' => $loadData];  // Возвращаем разобранные данные
     }
 }
