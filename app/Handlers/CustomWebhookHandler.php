@@ -77,7 +77,7 @@ class CustomWebhookHandler extends WebhookHandler
                 return;
             }
             $path = $this->bot->store($fileId, Storage::path('telegraph'));
-
+            LOG::info(print_r($path));
             $processingService = new PDFProcessingService($userName, $statement);
             switch ($statement) {
                 case 'sberbank':

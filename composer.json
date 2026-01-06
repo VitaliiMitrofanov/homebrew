@@ -13,6 +13,8 @@
         "laravel/framework": "^10.10",
         "laravel/sanctum": "^3.3",
         "laravel/tinker": "^2.8",
+        "nutgram/laravel": "^1.6",
+        "spatie/laravel-http-logger": "^1.11",
         "spatie/pdf-to-text": "^1.54"
     },
     "require-dev": {
